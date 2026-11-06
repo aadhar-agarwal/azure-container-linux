@@ -110,6 +110,45 @@ running or stopped.
 The mode is selected **at boot**. Changing the tag does not change a running
 node's policy state or containerd configuration.
 
+## Containerd configuration in audit mode
+
+When IPE audit is activated, containerd uses the EROFS profile. EROFS is a
+read-only filesystem used for container layers. The profile also enables
+discovery of dm-verity metadata for signed layers.
+
+The startup sequence is:
+
+1. The IPE loader installs a systemd drop-in at
+   `/run/systemd/system/containerd.service.d/90-acl-profile.conf`.
+2. Before containerd starts, a profile selector combines the existing base
+   config with `/usr/share/containerd/acl-erofs.toml`.
+3. The selector writes `/run/containerd/acl-config.toml`, and containerd starts
+   with `--config /run/containerd/acl-config.toml`.
+
+**The base config is not overwritten.** The generated file imports it and adds
+the IPE profile's overrides. On AKS, the base config is normally
+`/etc/containerd/config.toml`.
+
+The [IPE profile](../../build_library/rpm/additional_files/containerd2/containerd-acl-erofs.toml)
+sets:
+
+| Setting | Audit-mode value | Purpose |
+|---|---|---|
+| Container image snapshotter | `erofs` | Use EROFS for container layers |
+| `enable_dmverity_referrers` | `true` | Find the dm-verity metadata used to verify signed layers |
+| Diff plugin order | `["erofs", "walking"]` | Try the EROFS diff plugin before the general-purpose walking plugin |
+
+After IPE is disabled and the node reboots, the drop-in is no longer installed.
+Containerd uses the base config directly, normally with `overlayfs` on AKS.
+
+If containerd lacks the required support or the settings conflict, the selector
+can fall back to the base config. It logs a warning and only allows this
+fallback when IPE's `enforce` setting is `0`. IPE audit stays active, but the
+signed EROFS profile is not enabled. If that setting is not `0` or cannot be
+read, the selector fails and containerd does not start.
+
+See [Containerd verification](#containerd) to check the running configuration.
+
 ## Enable or disable audit
 
 Set the `acl-node-security-profile` tag to `ipe=audit` to enable audit, or
@@ -249,8 +288,7 @@ If other policies appear under `policies/`, check their `active` files too.
 
 ### Containerd
 
-EROFS is the read-only filesystem used by the IPE containerd profile for
-container layers. Check which configuration containerd is running:
+Check which configuration containerd is running:
 
 ```bash
 systemctl is-active containerd
@@ -258,9 +296,9 @@ PID="$(systemctl show containerd -p MainPID --value)"
 tr '\0' ' ' < "/proc/$PID/cmdline"; echo
 ```
 
-Audit normally selects `/run/containerd/acl-config.toml`, which merges the
-base configuration with `/usr/share/containerd/acl-erofs.toml`. Show the
-relevant settings without printing registry credentials:
+For the [audit profile](#containerd-configuration-in-audit-mode), expect
+`--config /run/containerd/acl-config.toml`. Show its settings without printing
+registry credentials:
 
 ```bash
 containerd --config /run/containerd/acl-config.toml config dump |
@@ -269,13 +307,8 @@ containerd --config /run/containerd/acl-config.toml config dump |
 
 Expect the container image snapshotter `erofs`,
 `enable_dmverity_referrers=true`, and diff plugin order `erofs`, `walking`.
-Referrers point to the dm-verity metadata used to verify signed container
-layers. Disabled mode selects the base config, commonly
-`/etc/containerd/config.toml` on AKS; use the path shown by the running process.
-
-In audit mode, the profile selector can fall back to the base configuration
-if the EROFS profile is incompatible. IPE audit stays active, but the signed
-EROFS profile is not enabled. Check containerd logs and workload health.
+If these differ, check containerd logs for a profile fallback and verify
+workload health.
 
 ### Audit events
 
