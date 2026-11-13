@@ -4,202 +4,254 @@ type: project
 updated: 2026-11-13
 ---
 
-# Signed EROFS dm-verity availability review
+# Signed container checks: what can break and what to fix first
 
-Source: [`erofs-signed-dmverity.patch` at `aclmain@30df5483`][patch].
-Locations below are patch lines unless otherwise identified. This revision
-incorporates independent cross-review and focused synthetic checks; it is not
-live AKS/kernel qualification or evidence of a production outage.
+**Bottom line:** signing failures can stop new containers, even in IPE audit
+mode. If the affected container is `pause`, new pods cannot start and AKS node
+provisioning can stall. The first code fix should make corrected signatures
+actually replace the old signatures used by cached images.
 
-## Verdict
+These risks apply when the signed-container path is selected. The reviewed ACL
+loader does not enable it by default; enabling IPE audit can select it.
 
-**Signed mount failures can block AKS node provisioning even with IPE in audit
-mode.** If the affected image is `pause`, new pod sandboxes cannot start.
-IPE audit does not relax containerd or kernel signature checks.
+Reviewed and rechecked against [`aclmain@30df5483`][patch]. The code is unchanged
+since the independent cross-review. Findings below distinguish confirmed bugs,
+intentional restrictions, and rollout decisions. This is not a report of a
+verified production outage.
 
-**The clearest recovery defect is stale cached signatures:** a corrected
-signature can be accepted during re-pull without replacing the signature used
-by existing signed snapshots.
+## Enough context to read this review
 
-Strict verification is appropriate when required. The rollout concern is making
-signing an availability dependency merely by enabling IPE audit, without a tested
-renewal and recovery path.
-
-## AKS impact
-
-The [sandbox path][sandbox] uses the patched `customopts.WithNewSnapshot` for
-`pause`. [Task creation][task-create] activates mounts before starting the shim.
-An image can therefore pass unpack checks but fail kernel signature verification
-at mount time, before the container executes.
-
-| Failure | Availability boundary |
+| Term | Plain-language meaning |
 |---|---|
-| Signed `pause` cannot mount | New sandboxes using that image fail, including system pods. Provisioning, scale-out, and node replacement can stall. |
-| Another signed system image fails | The component cannot start; wider network/storage/bootstrap effects depend on its role. |
-| Signed application image fails | Ordinarily affects new/restarted containers using that image. |
-| Configured EROFS snapshotter cannot initialize | Can also prevent CRI image-service initialization, affecting unsigned workloads. |
-| Signature/referrer changes while containers are running | Existing mounted containers generally continue. Subsequent pulls, fresh mounts, or reboot expose failures. |
+| Container image | The files needed to run an application. |
+| Containerd | Software on the node that downloads ("pulls") images and starts containers. |
+| Signature and certificate | A digital approval stamp, and information the machine uses to recognize a trusted signer. |
+| Signing bundle / referrer | A separate attachment containing the signature and information needed to build and verify the protected container filesystem. |
+| Local snapshot | Containerd's saved, unpacked copy of an image, reused when starting containers. |
+| `pause` | A small helper container Kubernetes needs to start normal pods. Its failure has a wider impact than one application failing. |
 
-A pause failure does **not** automatically set `RuntimeReady=false` or make every
-existing node `NotReady`: the [CRI status check][status] does not test pause
-mounting. A ready node can still fail new pods. This is not an inherent host crash.
-Actual data corruption is different: dm-verity checks reads and can produce
-[I/O failures after startup][verity].
+For images using this signing path, Linux checks the signature when opening
+the container filesystem. **IPE audit controls a different, later execution
+check. It does not turn a failed signature check into a warning.**
 
-## Concerns
+## Recommended fix order
 
-### 1. issue (blocking for renewal/recovery): Corrected signatures remain unused
+**Immediate rollout gate:** before enabling this more broadly, verify that the
+real pause image starts with the actual trust settings on every supported node
+image path, and test recovery. Do not rely on the words "audit mode" for safety.
 
-An image is materialized with root H and signature S1. The publisher replaces
-its bundle with the same H and a usable S2. Re-pull accepts the replacement,
-but the snapshot key excludes the signature digest and cache validation ignores
-the change. Application is skipped, preserving S1 in both snapshot labels and
-the local `.sig` file.
+The order below is a recommendation, not an approved implementation plan:
 
-If S1 is unusable for a fresh mapper, mounts keep failing despite the corrective
-pull. A fresh snapshot cache can work while an older cache fails. An active
-mapper can mask this until teardown/reboot. Restoring trust in S1 is a different
-recovery path and may work without replacing the snapshot.
+| Order | What to address | Validity and priority |
+|---|---|---|
+| **1** | Corrected signatures are ignored by cached images | **Confirmed recovery defect.** Re-pulling can succeed without fixing the failing start. |
+| **2** | Publishing another signing bundle breaks pulls | **Confirmed intentional restriction.** Define safe publishing and replacement before allowing retries or signing-key changes to create different bundles. |
+| **3** | Audit behavior and recovery are not clearly separated | **Confirmed design/rollout gap, not a broken verifier.** Decide whether signing is optional and provide a tested transition. |
+| **4** | Signing-discovery failures have inconsistent outcomes | **Confirmed integration behavior, partly inherited.** Distinguish an unavailable check from a confirmed absence of signing information. |
+| **5** | A changing image tag can reject an otherwise cached image | **Source-confirmed startup regression.** Usually retryable; lower priority than shared pause or signature-recovery failures. |
 
-**Location:** key L1484-L1495; validation L1596-L1620; accepted replacement
-L2056-L2077; snapshot labels used for mounting L2845-L2857.
-**Remedy:** version signed snapshot keys/chains by signature identity, or design
-an equivalent safe renewal mechanism. Never overwrite or evict snapshots
-backing running containers.
+## 1. A fixed signature can be ignored
 
-### 2. issue (blocking for publisher compatibility): Referrer updates can break pulls
+**issue (blocking for recovery): confirmed defect**
 
-Referrers attach to a manifest digest, not a tag. Pinning the image digest does
-not freeze its attached referrers. A new image digest is different from
-re-signing or rerunning publication for the same digest.
+A node saves an image with signature A. That signature cannot be trusted.
+The publisher supplies a valid signature B for the same filesystem. The node
+downloads the update, but containerd reuses its saved filesystem **with
+signature A still attached**.
 
-| Publisher change | Current behavior |
+The code decides whether to reuse the saved copy using the filesystem
+fingerprint, called its *root hash*. It deliberately ignores a changed
+signature. Updating the downloaded bundle does not update the saved `.sig` file.
+
+**Why it matters:** a fresh node can work while an older node keeps failing,
+even after a successful re-pull. A currently mounted copy can hide the problem
+until it is mounted again or the node reboots. Restoring trust in A is a
+different recovery path that may also work.
+
+**Fix first:** give different signatures separate saved-snapshot identities
+and chains, or implement an equivalent safe renewal mechanism. Do not overwrite
+or delete a copy that a running container is using.
+
+**Evidence:** patch L1484-L1495, L1596-L1620, L2056-L2077, L2845-L2857.
+An isolated test confirmed that cache validation accepts the old signature
+when the root hash is unchanged. The Linux mount failure was not reproduced.
+
+## 2. Two signing attachments can block the same image
+
+**issue (blocking for publisher compatibility): valid concern, intentional behavior**
+
+This means two different attachments for **one exact image**, not two container
+versions:
+
+```text
+Same container image
+  +-- Bundle A: original signing information
+  +-- Bundle B: different signing information, perhaps after re-signing
+```
+
+The patch refuses to choose between them, so new pulls fail. This could happen
+if a publishing rerun uploads a different bundle without removing the old one.
+We have not verified that the publisher currently does this.
+
+A genuinely new image version normally has a different identity and its own
+bundle. Repeating an identical bundle, or attaching unrelated metadata, does
+not trigger this duplicate-bundle rejection.
+
+There are also replacement traps:
+
+| Change to the same image's attachments | Result today |
 |---|---|
-| Add a second distinct matching dm-verity bundle | Pull fails before consulting the retained bundle, even when one candidate was usable. |
-| Replace with one bundle having the same roots | Accepted, but encounters the stale-signature behavior above. |
-| Replace with one bundle having different roots | Previously observing nodes reject it; fresh nodes can accept the sole current bundle. |
-| Remove all referrers | Previously observing nodes preserve their signed selection. This is not a universal rollback. |
+| Add a second distinct signing bundle | Pull fails, even if a previously used bundle is still available. |
+| Replace the only bundle, keeping the same filesystem fingerprint | Accepted, but issue 1 can keep the old signature in use. |
+| Replace it with a different filesystem fingerprint | Nodes remembering the old bundle reject it; fresh nodes can accept it. |
+| Remove the bundles entirely | Nodes remembering a signed bundle keep using it. Removal is not a universal rollback. |
 
-Only distinct matching bundle digests trigger the duplicate rejection. Repeated
-identical descriptors and unrelated artifacts such as SBOMs do not.
+**Next fix:** keep publishing repeatable without creating extra bundles while
+current clients require one. Then design replacement together with issue 1.
+Adding the new bundle before deleting the old creates a failure window;
+deleting first can make fresh nodes treat the image as unsigned.
 
-**Location:** discovery L1789-L1815; replacement L2056-L2077; retained selection
-L1987-L2020 and L2050-L2053.
-**Remedy:** maintain one canonical, idempotently published bundle while current
-clients reject duplicates. A replacement protocol needs a compatible client
-rollout first. Pushing a new bundle before deleting the old creates a pull-failure
-window; deleting first creates an unsigned-discovery window on fresh nodes.
+**Do not just select "newest."** Registry order is not a reliable clock, a
+timestamp does not prove trust, and a newer signature may be untrusted on
+older nodes. A safe rule must handle trusted signatures, conflicting filesystem
+fingerprints, and the saved copies already on nodes.
 
-**"Pick newest" alone is insufficient.** [OCI referrers][referrers-spec] have no
-guaranteed chronological ordering or mandatory trusted timestamp. A deterministic
-choice can still select a signature the node cannot trust. Selection must account
-for trust and conflicting roots, and must be paired with signature-versioned
-materialization. Do not silently accept a changed root merely because it is newer.
+**Evidence:** patch L1789-L1815, L1987-L2020, L2050-L2077; [OCI referrers][referrers-spec].
 
-### 3. issue (rollout-policy): Audit is not optional signature enforcement
+## 3. Audit mode does not provide a safe escape hatch
 
-Missing trust, invalid signatures, or unreadable signature files can block
-startup. This is deliberate fail-closed behavior, not itself an implementation
-bug. `dmverity_mode = "auto"` does not retry signed failures unsigned.
+**issue (rollout-policy): valid risk, not a signature-verification bug**
 
-Disabling referrers is not a hot recovery switch: existing signed parents reject
-new mounts. Combining referrers with `dmverity_mode = "off"` prevents snapshotter
-initialization. Existing running mounts are not automatically torn down.
+If a node cannot recognize a signer, it refuses to open the signed filesystem.
+That is correct when signing is required. The surprise is that enabling IPE
+audit also enables this runtime path, although audit sounds non-disruptive.
 
-**Location:** mount failures L2574-L2586 and L2615-L2648; configuration
-L2793-L2806; disabled signed-parent rejection L2845-L2857.
-**Remedy:** separate optional/required signing policy from IPE execution mode.
-Qualify migration to separate ordinary snapshots and container recreation.
+Simply turning the feature off is not enough either. Existing saved copies
+marked as signed reject new mounts when referrer support is disabled.
+Setting `dmverity_mode = "off"` while referrers remain enabled prevents the
+EROFS filesystem plugin from initializing. These switches do not automatically
+tear down already-running containers.
 
-### 4. issue (availability and coverage): Discovery failures have mixed outcomes
+**Decision needed:** separate the signing policy from IPE audit mode:
 
-A returned `FetchReferrers` error aborts the pull, including for otherwise usable
-unsigned images. Malformed/incomplete bundles also fail. However, the upstream
-[Docker fetcher][fetcher] can turn an API error followed by a fallback-tag 404
-into an empty result.
+| Explicit operator choice | Proposed behavior on a signing-path failure |
+|---|---|
+| Signing required | Refuse to start; never silently weaken verification. |
+| Signing optional | Report the failure and use a separate ordinary copy rebuilt from the original image, if that downgrade is authorized. |
 
-Focused synthetic results against the reviewed source:
+This fallback is **not implemented today**. Test how existing containers and
+saved images move to the ordinary path during rollback. Never bypass checks on
+the failed signed filesystem itself or reuse its signed identity for unsigned data.
 
-| Referrers API / fallback response | Result |
+**Evidence:** patch L2574-L2586, L2615-L2648, L2793-L2806, L2845-L2857;
+[boot-time activation][loader].
+
+## 4. Checking for signing information can itself fail
+
+**issue (availability and coverage): confirmed, but not every registry error is fatal**
+
+Containerd makes extra requests to the image registry (the server hosting
+images) to find signing bundles. The original image may be available while
+those requests fail.
+
+Some failures abort the pull, including for unsigned images. Others become
+"no bundle found," allowing ordinary unsigned handling on a node that has
+not previously remembered a signed bundle. That existing signed record is not
+cleared by an empty lookup.
+
+**Fix after agreeing on policy:** distinguish "the check was unavailable" from
+"the check succeeded and found nothing." Record degradation visibly. Do not
+blindly treat every error as either fatal or permission to run unsigned.
+Part of this behavior comes from upstream containerd's registry client,
+not new code in this patch.
+
+**Evidence:** patch L1781-L1788, L1922-L1929, L1982-L2020; [registry client][fetcher].
+The response combinations in the appendix were reproduced.
+
+## 5. A moving image name can cause a retryable startup failure
+
+**issue (non-blocking): source-confirmed regression**
+
+Kubernetes resolves `app:stable` to image A. Before the container is created,
+another pull moves that name to image B. The new helper looks up the name again
+and rejects the mismatch, even if the exact image A remains saved locally.
+Removing the name can produce a similar failure.
+
+This affects unsigned images too when the new snapshotter capability is active.
+It is a narrower startup race, not evidence that a node is permanently broken.
+
+**Fix:** preserve the exact image already requested. Only fall back to another
+saved reference when it unambiguously identifies the same image and signed
+filesystem; do not silently select a different signed version.
+
+**Evidence:** `dmverityContainerImage`, patch L790-L908. Source path confirmed;
+no live Kubernetes race reproduction.
+
+## What this does and does not mean for AKS
+
+| Situation | Expected scope |
+|---|---|
+| `pause` cannot open its filesystem | New pod sandboxes using it fail, including essential system pods. Fresh-node provisioning and node replacement can stall. |
+| One application image fails | Usually that application's new/restarted containers, not every workload. |
+| Containers are already running | They generally continue through signing-metadata changes. A new mount or reboot can reveal the problem later. |
+| Existing node reports `Ready` | This does not prove it can start pause. The runtime status check does not attempt a pause mount. |
+
+These are not inherent host crashes. Actual data corruption is a different case:
+dm-verity checks reads and can cause [I/O failures after startup][verity].
+See the [sandbox startup][sandbox], [task creation][task-create], and
+[runtime status][status] paths.
+
+## Other checked items: do not confuse these with new bugs
+
+| Item | Assessment |
+|---|---|
+| Kernel feature unavailable | Referrer-enabled EROFS can fail initialization. The service attempts module loading, but this does not prove signer trust. |
+| Incompatible local-pull configuration | ACL already has an [audit-mode base-profile fallback][selector]. Do not claim this is wholly unguarded. |
+| Signed image volumes or native EROFS image layers | Explicitly unsupported paths, not accidental verification failures. |
+| Preloaded images that never discovered a bundle | Can remain unsigned. Successful warm-cache tests do not qualify a fresh signed pull. |
+| Concurrent first-mount race | Inherited from unsigned dm-verity handling; not introduced by this patch. |
+| Non-Linux builds | New unconditional dependency on Linux keyring code breaks portability. Lower priority for this Linux-only rollout. |
+
+## Verification and release gates
+
+The source and earlier focused test results were rechecked. The core signature
+recovery finding was independently identified by all four requested reviewers.
+Other claims were narrowed or reclassified rather than counting every rejection
+as a bug.
+
+Before wider rollout, test the real pause image with missing trust, corrected
+signatures, overlapping old/new signing certificates, duplicate bundles,
+registry errors, offline preloads, fresh and existing saved copies, reboot,
+and rollback during node replacement.
+
+**Still unverified:** live AKS/kernel mounts, actual deployed trust, production
+registry failure rates, and publisher rerun behavior. No full production RPM
+qualification was performed. Fixing SELinux mount labels does not fix these
+signature-renewal or registry-selection paths.
+
+<details>
+<summary>Technical appendix: reproduced registry behavior</summary>
+
+The registry client can try both the referrers API and a fallback tag lookup.
+These results are for the reviewed source, not measurements of MCR:
+
+| API / fallback response | Result |
 |---|---|
 | 404/404, 405/404, or 500/404 | Empty successful discovery |
 | 403/403 or 500/500 | Error; patch aborts pull |
 | Malformed JSON with API 200 | Error; patch aborts pull |
 | Valid empty index with API 200 | Empty successful discovery |
 
-Empty discovery permits ordinary unsigned handling when no signed observation
-was previously retained; it does not clear an existing signed observation.
-Neither outcome's production frequency was measured.
+The signature-cache test used unmodified `ValidateDmveritySnapshot` and showed
+that different signature identities with the same root hash are accepted without
+updating the old identity. It did not exercise Linux signature verification.
 
-**Location:** patch L1781-L1788, L1922-L1929, L1982-L2020; upstream fetcher
-`core/remotes/docker/referrers.go`.
-**Remedy:** distinguish unknown discovery state from confirmed absence. Make
-degradation policy explicit rather than treating every error as either fatal
-or unsigned.
+Current configuration details: the loader defaults IPE off, activates the EROFS
+profile after successful audit activation, and does not support the
+`ipe=enforcing` runtime tag. `dmverity_mode = "auto"` is not an unsigned retry
+for failed signed mounts.
 
-### 5. issue (non-blocking): Mutable-tag resolution can reject a cached image ID
-
-The new CRI resolver can receive a resolved image ID plus `UserSpecifiedImage`.
-If another pull moves that tag, or the tag disappears before container creation,
-the helper rejects the request despite the old immutable image remaining cached.
-This path applies to unsigned images on a referrer-capable snapshotter too.
-It is generally a retryable startup failure, not a permanent node failure.
-
-**Location:** `dmverityContainerImage`, patch L790-L908.
-**Remedy:** preserve the requested immutable identity; use an ID-based fallback
-only when the retained manifest/materialization is unambiguous.
-
-## Compatibility boundaries
-
-- The [loader][loader] defaults IPE off. Successful audit activation installs the
-  EROFS profile. The `ipe=enforcing` tag is not supported by this loader.
-- ACL already [falls back to its base profile][selector] in audit mode for
-  incompatible local-pull configuration. The service attempts module loading.
-  Neither guard tests actual kernel signer trust or a signed pause mount.
-- Signed image volumes and signed native EROFS layers are explicitly unsupported
-  (patch L1025-L1050 and L2300-L2304).
-- Preloaded images without a signed observation can remain unsigned without
-  discovery. Warm-cache success does not prove a fresh signed pull/mount works.
-- The shared-mapper first-mount race is inherited from upstream unsigned
-  dm-verity handling, not a new patch-introduced defect.
-- The unconditional `verity` import also breaks non-Linux `pkg/snapshotters`
-  builds through its Linux-only keyring dependency. This is a portability issue,
-  not an ACL Linux runtime failure.
-
-## Proposed rollout behavior
-
-Recommendation, not an implemented or approved design. IPE audit alone must not
-be treated as authorization to downgrade a required signed mount.
-
-| Operator policy | Signing-path failure |
-|---|---|
-| Off | Preserve baseline image handling, with a tested transition for existing signed snapshots. |
-| Explicitly optional signing | Warn and record degradation; use a separate ordinary snapshot rebuilt from the original OCI layers. |
-| Required | Fail the affected pull or mount; never silently downgrade. |
-
-Never mount the failed signed filesystem raw, ignore corruption, or give an
-unsigned snapshot a signed identity. Preserve OCI digest checks and unrelated
-storage failures; clean up partial signed state. A generic mount retry is not enough.
-
-Keep activation controlled until renewal and recovery are qualified. Validate
-the real pause image against the actual kernel trust available on each supported
-image-definition path, not just certificate presence in a publishing artifact.
-
-Gate rollout on corrected signatures, old/new trust overlap, duplicate and
-root-changing bundles, registry failures, offline preloads, fresh versus existing
-snapshots, active mappers, reboot, and rollback during node replacement.
-
-## Evidence limits
-
-The registry cases above were reproduced, and an isolated test of unmodified
-`ValidateDmveritySnapshot` confirmed that same-root/different-signature cache
-validation succeeds without updating the old identity. These demonstrate code
-behavior, not Linux signature verification.
-
-No live AKS/kernel mount test or full production RPM qualification was performed.
-Actual deployed keyrings, registry failure frequency, and publisher rerun
-behavior remain to be verified. SELinux mount-label fixes do not alter the
-signature verification or referrer replacement paths reviewed here.
+</details>
 
 [patch]: https://github.com/microsoft/azure-container-linux/blob/30df5483fa40dc320a852546a2973effce5d4f99/acl/SPECS/containerd2/erofs-signed-dmverity.patch
 [selector]: https://github.com/microsoft/azure-container-linux/blob/30df5483fa40dc320a852546a2973effce5d4f99/build_library/rpm/additional_files/containerd2/containerd-acl-select-profile#L235-L273
