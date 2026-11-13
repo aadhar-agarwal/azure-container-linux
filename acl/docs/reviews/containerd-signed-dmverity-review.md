@@ -36,10 +36,6 @@ check. It does not turn a failed signature check into a warning.**
 
 ## Recommended fix order
 
-**Immediate rollout gate:** before enabling this more broadly, verify that the
-real pause image starts with the actual trust settings on every supported node
-image path, and test recovery. Do not rely on the words "audit mode" for safety.
-
 The order below is a recommendation, not an approved implementation plan:
 
 | Order | What to address | Validity and priority |
