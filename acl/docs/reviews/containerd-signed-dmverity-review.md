@@ -16,8 +16,7 @@ loader does not enable it by default; enabling IPE audit can select it.
 
 Reviewed and rechecked against [`aclmain@30df5483`][patch]. The code is unchanged
 since the independent cross-review. Findings below distinguish confirmed bugs,
-intentional restrictions, and rollout decisions. This is not a report of a
-verified production outage.
+intentional restrictions, and rollout decisions.
 
 ## Enough context to read this review
 
